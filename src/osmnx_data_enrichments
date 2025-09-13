@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# /src/enrich_osm.py
+import argparse, csv, re
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional, Any
+from collections import Counter
+import random
+import osmnx as ox
+
+# ---------------- settings / cache ----------------
+GRAPH_PATH = Path("data/cache/osm_graph.graphml")
+GRAPH_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# NYC bbox (south, west, north, east)
+NYC_BBOX = (40.4774, -74.2591, 40.9176, -73.7004)
+
+# plausible urban/suburban defaults with weights (MPH)
+DEFAULT_SPEEDS_MPH = [15, 20, 25, 30, 35, 40, 45, 50]
+DEFAULT_SPEEDS_WEIGHTS = [0.05, 0.10, 0.25, 0.20, 0.15, 0.10, 0.10, 0.05]
+
+# for highway fallback when outside NYC or no tag/default: (kph → converted to mph)
+IMPUTE_BY_HIGHWAY_KPH = {
+    "motorway": 105, "trunk": 90, "primary": 65, "secondary": 55,
+    "tertiary": 40, "residential": 40, "living_street": 25, "service": 25
+}
+
+# ---------------- helpers ----------------
+def in_nyc(lat: float, lng: float) -> bool:
+    s, w, n, e = NYC_BBOX
+    return (s <= lat <= n) and (w <= lng <= e)
+
+def read_coords(infile: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with open(infile, newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append(row)
+    if not rows:
+        raise SystemExit(f"No rows found in {infile}")
+    must = {"segment_id", "seq", "lat", "lng"}
+    if not must.issubset(set(rows[0].keys())):
+        raise SystemExit(f"{infile} must contain columns: {sorted(must)}")
+    return rows
+
+def bbox_from_coords(rows: List[Dict[str, str]], pad_deg: float = 0.01) -> Tuple[float, float, float, float]:
+    lats = [float(r["lat"]) for r in rows]
+    lngs = [float(r["lng"]) for r in rows]
+    south, north = min(lats) - pad_deg, max(lats) + pad_deg
+    west,  east  = min(lngs) - pad_deg, max(lngs) + pad_deg
+    # OSMnx v1: (north, south, east, west)
+    return (north, south, east, west)
+
+def load_or_build_graph(bbox_ns_ew: Tuple[float, float, float, float], network_type: str = "drive"):
+    if GRAPH_PATH.exists():
+        try:
+            return ox.load_graphml(GRAPH_PATH)
+        except Exception:
+            pass
+    north, south, east, west = bbox_ns_ew
+    G = ox.graph_from_bbox(north=north, south=south, east=east, west=west, network_type=network_type)
+    ox.save_graphml(G, GRAPH_PATH)
+    return G
+
+def nearest_edge_uvk(G, lat: float, lng: float) -> Tuple[Any, Any, int]:
+    res = ox.distance.nearest_edges(G, X=[lng], Y=[lat], return_dist=False)
+    # normalize result shape
+    if isinstance(res, tuple) and len(res) == 3 and hasattr(res[0], "__len__"):
+        u, v, karr = res[0][0], res[1][0], res[2][0] if res[2] is not None else 0
+        return (u, v, int(karr) if karr is not None else 0)
+    item = res[0] if isinstance(res, list) else res
+    u, v = item[0], item[1]
+    k = item[2] if len(item) >= 3 and item[2] is not None else 0
+    return (u, v, int(k))
+
+def edge_attrs(G, u, v, k) -> Dict[str, Any]:
+    data = G.get_edge_data(u, v, k)
+    if isinstance(data, dict) and 0 in data:
+        data = data[0]
+    return data if isinstance(data, dict) else {}
+
+def _norm(v):
+    if isinstance(v, (list, tuple)):
+        return v[0] if v else None
+    return v
+
+def parse_bool(v):
+    s = str(v).strip().lower()
+    return 1 if s in {"1","true","yes","y","t"} else 0 if s in {"0","false","no","n","f"} else None
+
+def parse_lanes(v):
+    if v is None: return None
+    try:
+        s = str(v).split(";")[0].split("|")[0].strip()
+        return int(float(s))
+    except: return None
+
+def parse_width_m(v):
+    if v is None: return None
+    s = str(v).lower().strip()
+    m = re.search(r"(\d+(\.\d+)?)", s)
+    if not m: return None
+    val = float(m.group(1))
+    if "ft" in s or "feet" in s or "'" in s:
+        return round(val * 0.3048, 2)
+    return round(val, 2)
+
+ROAD_CLASS_RANK = {
+    "motorway":6, "trunk":5, "primary":4, "secondary":3,
+    "tertiary":2, "residential":1, "service":0, "living_street":0
+}
+def road_class(hw):
+    if not hw: return "other", -1
+    key = hw.split(";")[0].strip().lower()
+    if key not in ROAD_CLASS_RANK:
+        if "motorway" in key: key="motorway"
+        elif "trunk" in key: key="trunk"
+        elif "primary" in key: key="primary"
+        elif "secondary" in key: key="secondary"
+        elif "tertiary" in key: key="tertiary"
+        elif "residential" in key: key="residential"
+        elif "living" in key: key="living_street"
+        elif "service" in key: key="service"
+        else: return "other", -1
+    return key, ROAD_CLASS_RANK[key]
+
+def impute_maxspeed_kph(highway: Optional[str]) -> float:
+    if not highway: return 40.0
+    hw = highway.split(";")[0].strip().lower()
+    return float(IMPUTE_BY_HIGHWAY_KPH.get(hw, 40.0))
+
+def parse_maxspeed_to_mph_usaware(raw: any, lat: float, lng: float) -> Optional[float]:
+    """
+    Returns MPH or None.
+    U.S. rule (NYC here): if tag looks like 'NN' or 'NN km/h', assume it's actually MPH (mislabeled).
+    Elsewhere: convert 'NN km/h' to mph; unitless assumed km/h → mph.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    m = re.search(r"(\d+(\.\d+)?)", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    if "mph" in s:
+        return round(val, 1)
+    if in_nyc(lat, lng):
+        return round(val, 1)  # treat km/h or unitless as mph (mislabeled)
+    # outside NYC: convert km/h (or unitless assume km/h) to mph
+    return round(val / 1.60934, 1)
+
+# ---------------- main enrich ----------------
+def enrich(infile: str, outfile: str, bbox_override: Optional[str] = None, seed: Optional[int] = 12345):
+    if seed is not None:
+        random.seed(seed)
+
+    rows = read_coords(infile)
+    if bbox_override:
+        north, south, east, west = (float(x) for x in bbox_override.split(","))
+        bbox_ns_ew = (north, south, east, west)
+    else:
+        bbox_ns_ew = bbox_from_coords(rows, pad_deg=0.01)
+
+    print("Loading/Building OSM graph… (first run may take a few minutes)")
+    G = load_or_build_graph(bbox_ns_ew, network_type="drive")
+    print("Graph ready.")
+
+    out_fields = [
+        "segment_id","seq",
+        "highway","road_class","road_class_rank",
+        "maxspeed_mph","speed_limit_source","speed_limit_conf",
+        "lanes","lanes_int","oneway","oneway_bool","surface","bridge","tunnel",
+        "name","ref","lit","lit_bool","cycleway","cycleway_type","width","width_m"
+    ]
+
+    Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+
+    # simple counters for a quick summary
+    source_counts = Counter()
+    default_mph_hist = Counter()
+
+    written = 0
+    with open(outfile, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=out_fields)
+        w.writeheader()
+
+        for i, r in enumerate(rows, start=1):
+            try:
+                lat = float(r["lat"]); lng = float(r["lng"])
+                u, v, k = nearest_edge_uvk(G, lat, lng)
+                attrs = edge_attrs(G, u, v, k)
+
+                highway = _norm(attrs.get("highway"))
+                lanes   = _norm(attrs.get("lanes"))
+                oneway  = _norm(attrs.get("oneway"))
+                surface = _norm(attrs.get("surface"))
+                bridge  = _norm(attrs.get("bridge"))
+                tunnel  = _norm(attrs.get("tunnel"))
+                name    = _norm(attrs.get("name"))
+                ref     = _norm(attrs.get("ref"))
+                lit_raw = _norm(attrs.get("lit"))
+                cycleway_raw = _norm(attrs.get("cycleway"))
+                width_raw = _norm(attrs.get("width"))
+                maxspeed_raw = _norm(attrs.get("maxspeed"))
+
+                # normalized fields
+                lanes_int   = parse_lanes(lanes)
+                oneway_bool = parse_bool(oneway)
+                lit_bool    = parse_bool(lit_raw)
+                width_m     = parse_width_m(width_raw)
+                rc, rc_rank = road_class(highway)
+
+                # speed handling (MPH only)
+                maxspeed_mph = parse_maxspeed_to_mph_usaware(maxspeed_raw, lat, lng)
+                if maxspeed_mph is None:
+                    if in_nyc(lat, lng):
+                        mph = random.choices(DEFAULT_SPEEDS_MPH, weights=DEFAULT_SPEEDS_WEIGHTS, k=1)[0]
+                        maxspeed_mph = float(mph)
+                        source = f"nyc_default_{mph}mph"
+                        conf = "medium"
+                        default_mph_hist[mph] += 1
+                    else:
+                        kph = impute_maxspeed_kph(highway)
+                        maxspeed_mph = round(kph / 1.60934, 1)
+                        source = "imputed_by_highway"
+                        conf = "low"
+                else:
+                    source = "tag"
+                    conf = "high"
+
+                # cycleway type bucket
+                if cycleway_raw:
+                    c = str(cycleway_raw).lower()
+                    if "track" in c: cycleway_type = "track"
+                    elif "lane" in c: cycleway_type = "lane"
+                    elif "share" in c or "sharrow" in c: cycleway_type = "shared"
+                    else: cycleway_type = "other"
+                else:
+                    cycleway_type = "none"
+
+                w.writerow({
+                    "segment_id": r["segment_id"],
+                    "seq": r["seq"],
+                    "highway": highway,
+                    "road_class": rc,
+                    "road_class_rank": rc_rank,
+                    "maxspeed_mph": maxspeed_mph,
+                    "speed_limit_source": source,
+                    "speed_limit_conf": conf,
+                    "lanes": lanes,
+                    "lanes_int": lanes_int,
+                    "oneway": oneway,
+                    "oneway_bool": oneway_bool,
+                    "surface": surface,
+                    "bridge": bridge,
+                    "tunnel": tunnel,
+                    "name": name,
+                    "ref": ref,
+                    "lit": lit_raw,
+                    "lit_bool": lit_bool,
+                    "cycleway": cycleway_raw,
+                    "cycleway_type": cycleway_type,
+                    "width": width_raw,
+                    "width_m": width_m
+                })
+                source_counts[source] += 1
+                written += 1
+
+                if written % 1000 == 0:
+                    print(f"[progress] enriched {written} / {len(rows)} points")
+            except Exception:
+                # keep alignment even if enrichment fails
+                w.writerow({
+                    "segment_id": r.get("segment_id"),
+                    "seq": r.get("seq"),
+                    "highway": None,
+                    "road_class": "other",
+                    "road_class_rank": -1,
+                    "maxspeed_mph": None,
+                    "speed_limit_source": "error",
+                    "speed_limit_conf": "low",
+                    "lanes": None,
+                    "lanes_int": None,
+                    "oneway": None,
+                    "oneway_bool": None,
+                    "surface": None,
+                    "bridge": None,
+                    "tunnel": None,
+                    "name": None,
+                    "ref": None,
+                    "lit": None,
+                    "lit_bool": None,
+                    "cycleway": None,
+                    "cycleway_type": "none",
+                    "width": None,
+                    "width_m": None
+                })
+                source_counts["error"] += 1
+
+    # summary
+    print(f"[done] wrote {written} rows → {outfile}")
+    total = sum(source_counts.values()) or 1
+    print("[summary] speed_limit_source mix:")
+    for k, v in source_counts.most_common():
+        pct = 100.0 * v / total
+        print(f"  {k:22s}: {v:6d} ({pct:4.1f}%)")
+    if default_mph_hist:
+        print("[summary] NYC defaults histogram (mph):")
+        for k in sorted(default_mph_hist):
+            print(f"  {k:>2} mph : {default_mph_hist[k]}")
+
+# ---------------- CLI ----------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Stage B: Enrich coordinates with OSM road attributes (MPH only).")
+    ap.add_argument("--coords", default="data/A_coords.csv", help="Input coords CSV from Stage A")
+    ap.add_argument("--out", default="data/B_attrs.csv", help="Output attributes CSV")
+    ap.add_argument("--bbox", help="Optional override bbox 'north,south,east,west' for graph build")
+    ap.add_argument("--seed", type=int, default=12345, help="Seed for NYC default speed randomness")
+    args = ap.parse_args()
+    enrich(args.coords, args.out, bbox_override=args.bbox, seed=args.seed)
