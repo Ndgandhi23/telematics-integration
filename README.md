@@ -33,9 +33,6 @@ REST API (FastAPI)
 uvicorn src.api:app --reload
 → Docs: http://127.0.0.1:8000/docs
 
-Clear database
-python bin/clear_db.py
-
 Model & Data
 
 Model: XGBoost, trained on tabular trip features (regression).
